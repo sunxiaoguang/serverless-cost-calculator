@@ -1,0 +1,360 @@
+use std::cmp::{max, min};
+use std::ops::Sub;
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Duration, Utc};
+use colored::*;
+use regex::Regex;
+use sqlx::{FromRow, MySql, Pool};
+
+#[derive(Default, Debug)]
+pub struct WorkloadDescription {
+    pub read_requests_per_hour: u64,
+    pub read_bytes_per_hour: u64,
+    pub write_requests_per_hour: u64,
+    pub write_bytes_per_hour: u64,
+    pub sent_bytes_per_hour: u64,
+    pub total_data_in_bytes: u64,
+    pub total_index_in_bytes: u64,
+}
+
+impl WorkloadDescription {
+    fn mysql(tables: TablesInformation, summary: MySQLStatementsSummary) -> Self {
+        let duration_in_minutes =
+            max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
+        let minutes_per_hour = 60 * 24;
+        let average_row_in_bytes =
+            (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
+        WorkloadDescription {
+            read_requests_per_hour: minutes_per_hour * summary.read_requests / duration_in_minutes,
+            read_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.read_rows
+                / duration_in_minutes,
+            write_requests_per_hour: minutes_per_hour * summary.write_queries / duration_in_minutes,
+            write_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.write_rows
+                / duration_in_minutes,
+            sent_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.sent_rows
+                / duration_in_minutes,
+            total_data_in_bytes: tables.total_data_in_bytes,
+            total_index_in_bytes: tables.total_index_in_bytes,
+        }
+    }
+
+    fn tidb(
+        tables: TablesInformation,
+        summary: Option<TiDBStatementsSummary>,
+        metrics: TiDBSystemMetrics,
+    ) -> Self {
+        let (write_bytes_per_hour, sent_bytes_per_hour) = match summary {
+            Some(summary) => {
+                let duration_in_minutes =
+                    max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
+                let minutes_per_hour = 60 * 24;
+                let average_row_in_bytes =
+                    (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
+                (
+                    minutes_per_hour * summary.write_bytes / duration_in_minutes,
+                    minutes_per_hour * summary.sent_rows * average_row_in_bytes
+                        / duration_in_minutes,
+                )
+            }
+            None => {
+                println!("{}", "The 'Statement Summary Tables' are disabled; when they are available, estimations can be more accurate.".bold().yellow());
+                println!("{}", "See https://docs.pingcap.com/tidb/stable/statement-summary-tables#parameter-configuration".bold().yellow());
+                (metrics.write_bytes_per_hour, 0)
+            }
+        };
+        WorkloadDescription {
+            read_requests_per_hour: metrics.read_requests_per_hour,
+            read_bytes_per_hour: metrics.read_bytes_per_hour,
+            write_requests_per_hour: metrics.write_requests_per_hour,
+            write_bytes_per_hour,
+            sent_bytes_per_hour,
+            total_data_in_bytes: tables.total_data_in_bytes,
+            total_index_in_bytes: tables.total_index_in_bytes,
+        }
+    }
+
+    fn tidb_serverless(tables: TablesInformation) -> Self {
+        WorkloadDescription {
+            total_data_in_bytes: tables.total_data_in_bytes,
+            total_index_in_bytes: tables.total_index_in_bytes,
+            ..Default::default() /* there is no metric for network egress */
+        }
+    }
+}
+
+pub async fn load_workload_description(
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    database: String,
+) -> Result<WorkloadDescription> {
+    let connection_string = format!(
+        "mysql://{}:{}@{}:{}/{}",
+        user, password, host, port, database
+    );
+    let pool = sqlx::MySqlPool::connect(&connection_string).await?;
+
+    let tables = read_tables_information(&pool, &database).await?;
+    if is_tidb(&pool).await? {
+        if is_tidb_serverless(&pool).await? {
+            // tidb serverless does not expose metrics and statements summary from SQL. Can only estimate storage cost
+            Ok(WorkloadDescription::tidb_serverless(tables))
+        } else {
+            Ok(WorkloadDescription::tidb(
+                tables,
+                read_tidb_statements_summary(&pool, &database).await?,
+                read_tidb_system_metrics(&pool).await?,
+            ))
+        }
+    } else {
+        if !is_mysql_performance_schema_enabled(&pool).await? {
+            return Err(anyhow!("Please enable performance schema on your MySQL Server. See: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"));
+        }
+        Ok(WorkloadDescription::mysql(
+            tables,
+            read_mysql_statements_summary(&pool, &database).await?,
+        ))
+    }
+}
+
+#[derive(FromRow)]
+struct TablesInformation {
+    total_rows: u64,
+    total_data_in_bytes: u64,
+    total_index_in_bytes: u64,
+}
+
+async fn check_variable_value(pool: &Pool<MySql>, variable: &str, value: &str) -> Result<bool> {
+    Ok(
+        sqlx::query_as(&format!("SHOW VARIABLES LIKE '{}'", variable))
+            .fetch_optional(pool)
+            .await?
+            .map(|v: (String, String)| v.1 == value)
+            .unwrap_or(false),
+    )
+}
+
+async fn read_tables_information(pool: &Pool<MySql>, database: &str) -> Result<TablesInformation> {
+    Ok(sqlx::query_as("SELECT CAST(SUM(TABLE_ROWS) AS UNSIGNED) AS total_rows, CAST(SUM(DATA_LENGTH) AS UNSIGNED) AS total_data_in_bytes, CAST(SUM(INDEX_LENGTH) AS UNSIGNED) AS total_index_in_bytes FROM information_schema.TABLES WHERE TABLE_SCHEMA=?")
+        .bind(database).fetch_one(pool).await?)
+}
+
+#[derive(Default)]
+struct MySQLStatementsSummary {
+    read_requests: u64,
+    read_rows: u64,
+    sent_rows: u64,
+    write_queries: u64,
+    write_rows: u64,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct MySQLStatementSummary {
+    #[sqlx(rename = "DIGEST_TEXT")]
+    sql: String,
+    #[sqlx(rename = "COUNT_STAR")]
+    count: u64,
+    #[sqlx(rename = "SUM_ROWS_AFFECTED")]
+    affected_rows: u64,
+    /* the term used IN MySQL official client is affect*/
+    #[sqlx(rename = "SUM_ROWS_SENT")]
+    sent_rows: u64,
+    #[sqlx(rename = "SUM_ROWS_EXAMINED")]
+    read_rows: u64,
+    #[sqlx(rename = "FIRST_SEEN")]
+    first_seen: DateTime<Utc>,
+    #[sqlx(rename = "LAST_SEEN")]
+    last_seen: DateTime<Utc>,
+}
+
+async fn is_mysql_performance_schema_enabled(pool: &Pool<MySql>) -> Result<bool> {
+    check_variable_value(pool, "performance_schema", "ON").await
+}
+
+async fn read_mysql_statements_summary(
+    pool: &Pool<MySql>,
+    database: &str,
+) -> Result<MySQLStatementsSummary> {
+    let statements_summary: Vec<MySQLStatementSummary> =
+        sqlx::query_as("SELECT DIGEST_TEXT, COUNT_STAR, SUM_ROWS_AFFECTED, SUM_ROWS_SENT, SUM_ROWS_EXAMINED, FIRST_SEEN, LAST_SEEN FROM performance_schema.events_statements_summary_by_digest WHERE SCHEMA_NAME=? AND LAST_SEEN >= DATE_SUB(NOW(), INTERVAL 7 DAY)")
+            .bind(database).fetch_all(pool).await?;
+    let now = Utc::now();
+    let seven_days_ago = now.sub(Duration::days(7));
+    if statements_summary.is_empty() {
+        return Ok(MySQLStatementsSummary {
+            end_time: now,
+            start_time: seven_days_ago,
+            ..Default::default()
+        });
+    }
+    let is_write_pattern = Regex::new("^INSERT |^DELETE |^UPDATE ")?;
+    Ok(statements_summary.into_iter().fold(
+        MySQLStatementsSummary {
+            start_time: now,
+            end_time: seven_days_ago,
+            ..Default::default()
+        },
+        |mut acc, statement| -> MySQLStatementsSummary {
+            acc.end_time = max(statement.last_seen, acc.end_time);
+            acc.start_time = min(statement.first_seen, acc.start_time);
+            acc.read_rows += statement.read_rows;
+            acc.sent_rows += statement.sent_rows;
+            acc.write_rows += statement.affected_rows;
+            if is_write_pattern.find(&statement.sql).is_some() {
+                acc.write_queries += statement.count;
+            } else {
+                acc.read_requests += statement.count;
+            }
+            acc
+        },
+    ))
+}
+
+#[derive(Default)]
+struct TiDBStatementsSummary {
+    read_requests: u64,
+    read_rows: u64,
+    sent_rows: u64,
+    write_queries: u64,
+    write_bytes: u64,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct TiDBStatementSummary {
+    #[sqlx(rename = "STMT_TYPE")]
+    statement_type: String,
+    #[sqlx(rename = "EXEC_COUNT")]
+    count: u64,
+    #[sqlx(rename = "AVG_RESULT_ROWS")]
+    avg_result_rows: u64,
+    #[sqlx(rename = "AVG_PROCESSED_KEYS")]
+    avg_processed_keys: u64,
+    #[sqlx(rename = "AVG_WRITE_SIZE")]
+    avg_write_bytes: u64,
+    #[sqlx(rename = "FIRST_SEEN")]
+    first_seen: DateTime<Utc>,
+    #[sqlx(rename = "LAST_SEEN")]
+    last_seen: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct TiDBSystemMetrics {
+    write_bytes_per_hour: u64,
+    write_requests_per_hour: u64,
+    read_bytes_per_hour: u64,
+    read_requests_per_hour: u64,
+}
+
+async fn is_tidb_stmt_summary_enabled(pool: &Pool<MySql>) -> Result<bool> {
+    check_variable_value(pool, "tidb_enable_stmt_summary", "ON").await
+}
+
+async fn read_tidb_system_metrics(pool: &Pool<MySql>) -> Result<TiDBSystemMetrics> {
+    let mut interval = 7;
+
+    loop {
+        let (start, end): (String, String) = sqlx::query_as(
+            "select CAST(DATE_SUB(NOW(), INTERVAL ? DAY) AS CHAR), CAST(NOW() AS CHAR)",
+        )
+        .bind(interval)
+        .fetch_one(pool)
+        .await?;
+        let sql = format!(
+            "SELECT 'write_bytes' AS type, CAST(SUM(`value`) AS UNSIGNED) AS `value` FROM metrics_schema.tidb_kv_write_total_size WHERE time BETWEEN '{}' AND '{}' UNION\n\
+                 SELECT 'write_requests' AS type, CAST(SUM(`value`) AS UNSIGNED) AS `value` FROM metrics_schema.tidb_kv_request_total_count WHERE type IN ('Prewrite', 'Commit') AND time BETWEEN '{}' AND '{}' UNION\n\
+                 SELECT 'read_bytes' AS type, CAST(SUM(`value`) AS UNSIGNED) AS `value` FROM metrics_schema.tikv_cop_total_rocksdb_perf_statistics WHERE metric IN ('get_read_bytes', 'iter_red_bytes') AND req IN ('index', 'select') AND time BETWEEN '{}' AND '{}' UNION\n\
+                 SELECT 'read_requests' AS type, CAST(SUM(`value`) AS UNSIGNED) AS `value` FROM metrics_schema.tidb_kv_request_total_count WHERE type not IN ('Prewrite', 'Commit') AND time BETWEEN '{}' AND '{}'"
+            , start, end, start, end, start, end, start, end);
+        let metrics: Result<Vec<(String, Option<u64>)>> = sqlx::query_as(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(Into::into);
+        if let Ok(metrics) = metrics {
+            let hours = interval * 24;
+            return Ok(metrics.into_iter().fold(
+                Default::default(),
+                |mut acc, metric| -> TiDBSystemMetrics {
+                    match metric.0.as_str() {
+                        "write_bytes" => acc.write_bytes_per_hour = metric.1.unwrap_or(0) / hours,
+                        "write_requests" => {
+                            acc.write_requests_per_hour = metric.1.unwrap_or(0) / hours
+                        }
+                        "read_bytes" => acc.read_bytes_per_hour = metric.1.unwrap_or(0) / hours,
+                        "read_requests" => {
+                            acc.read_requests_per_hour = metric.1.unwrap_or(0) / hours
+                        }
+                        _ => {}
+                    }
+                    acc
+                },
+            ));
+        }
+        if interval == 1 {
+            return Err(anyhow!("Failed to read metrics schema, please check your prometheus setup AND make sure it is working AS expected"));
+        }
+        interval -= 1;
+    }
+}
+
+async fn read_tidb_statements_summary(
+    pool: &Pool<MySql>,
+    database: &str,
+) -> Result<Option<TiDBStatementsSummary>> {
+    if !is_tidb_stmt_summary_enabled(pool).await? {
+        return Ok(None);
+    }
+    let statements_summary: Vec<TiDBStatementSummary> =
+        sqlx::query_as("SELECT STMT_TYPE, DIGEST_TEXT, EXEC_COUNT, AVG_AFFECTED_ROWS, CAST(AVG_RESULT_ROWS AS UNSIGNED) AS AVG_RESULT_ROWS, AVG_PROCESSED_KEYS, CAST(AVG_WRITE_SIZE AS UNSIGNED) AS AVG_WRITE_SIZE, FIRST_SEEN, LAST_SEEN FROM information_schema.CLUSTER_STATEMENTS_SUMMARY WHERE SCHEMA_NAME=? AND LAST_SEEN >= DATE_SUB(NOW(), INTERVAL 7 DAY)")
+            .bind(database).fetch_all(pool).await?;
+    let now = Utc::now();
+    let seven_days_ago = now.sub(Duration::days(7));
+    if statements_summary.is_empty() {
+        return Ok(Some(TiDBStatementsSummary {
+            end_time: now,
+            start_time: seven_days_ago,
+            ..Default::default()
+        }));
+    }
+    Ok(Some(statements_summary.into_iter().fold(
+        TiDBStatementsSummary {
+            start_time: now,
+            end_time: seven_days_ago,
+            ..Default::default()
+        },
+        |mut acc, statement| -> TiDBStatementsSummary {
+            acc.end_time = max(statement.last_seen, acc.end_time);
+            acc.start_time = min(statement.first_seen, acc.start_time);
+            acc.read_rows += statement.avg_processed_keys * statement.count;
+            acc.sent_rows += statement.avg_result_rows * statement.count;
+            acc.write_bytes += statement.avg_write_bytes * statement.count;
+            if matches!(
+                statement.statement_type.as_str(),
+                "Delete" | "Update" | "Insert" | "Replace"
+            ) {
+                acc.write_queries += statement.count;
+            } else {
+                acc.read_requests += statement.count;
+            }
+            acc
+        },
+    )))
+}
+
+async fn is_tidb(pool: &Pool<MySql>) -> Result<bool> {
+    let version: (String,) = sqlx::query_as("SELECT version()").fetch_one(pool).await?;
+    let is_tidb_pattern = Regex::new("^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-.*")?;
+    Ok(is_tidb_pattern.find(&version.0).is_some())
+}
+
+async fn is_tidb_serverless(pool: &Pool<MySql>) -> Result<bool> {
+    let version: (String,) = sqlx::query_as("SELECT version()").fetch_one(pool).await?;
+    let is_tidb_serverless_pattern =
+        Regex::new("^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-v\\d+\\.\\d+\\.\\d+-(?i)serverless(?-i).*")?;
+    Ok(is_tidb_serverless_pattern.find(&version.0).is_some())
+}
