@@ -7,6 +7,8 @@ use colored::*;
 use regex::Regex;
 use sqlx::{FromRow, MySql, Pool};
 
+const TARGET_REGION_SIZE: u64 = 256 * 1024 * 1024;
+
 #[derive(Default, Debug)]
 pub struct WorkloadDescription {
     pub read_requests_per_hour: u64,
@@ -23,16 +25,35 @@ impl WorkloadDescription {
         let duration_in_minutes =
             max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
         let minutes_per_hour = 60 * 24;
-        let average_row_in_bytes =
-            (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
+        let total_storage_in_bytes = tables.total_index_in_bytes + tables.total_data_in_bytes;
+        let average_row_size_in_bytes = total_storage_in_bytes / tables.total_rows;
+        let estimated_number_of_regions = total_storage_in_bytes / TARGET_REGION_SIZE;
+
+        let read_bytes_per_hour =
+            minutes_per_hour * average_row_size_in_bytes * summary.read_rows / duration_in_minutes;
+        let read_requests_per_hour = minutes_per_hour * summary.read_requests / duration_in_minutes;
+        let read_bytes_per_request = read_bytes_per_hour / read_requests_per_hour;
+        let read_regions_per_request = max(
+            read_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
+            1,
+        );
+
+        let write_bytes_per_hour =
+            minutes_per_hour * average_row_size_in_bytes * summary.write_rows / duration_in_minutes;
+        let write_requests_per_hour =
+            minutes_per_hour * summary.write_queries / duration_in_minutes;
+        let write_bytes_per_request = write_bytes_per_hour / write_requests_per_hour;
+        let write_regions_per_request = max(
+            write_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
+            1,
+        );
+
         WorkloadDescription {
-            read_requests_per_hour: minutes_per_hour * summary.read_requests / duration_in_minutes,
-            read_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.read_rows
-                / duration_in_minutes,
-            write_requests_per_hour: minutes_per_hour * summary.write_queries / duration_in_minutes,
-            write_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.write_rows
-                / duration_in_minutes,
-            sent_bytes_per_hour: minutes_per_hour * average_row_in_bytes * summary.sent_rows
+            read_requests_per_hour: read_requests_per_hour * read_regions_per_request,
+            read_bytes_per_hour,
+            write_requests_per_hour: write_requests_per_hour * write_regions_per_request,
+            write_bytes_per_hour,
+            sent_bytes_per_hour: minutes_per_hour * average_row_size_in_bytes * summary.sent_rows
                 / duration_in_minutes,
             total_data_in_bytes: tables.total_data_in_bytes,
             total_index_in_bytes: tables.total_index_in_bytes,
@@ -49,17 +70,17 @@ impl WorkloadDescription {
                 let duration_in_minutes =
                     max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
                 let minutes_per_hour = 60 * 24;
-                let average_row_in_bytes =
+                let average_row_size_in_bytes =
                     (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
                 (
                     minutes_per_hour * summary.write_bytes / duration_in_minutes,
-                    minutes_per_hour * summary.sent_rows * average_row_in_bytes
+                    minutes_per_hour * summary.sent_rows * average_row_size_in_bytes
                         / duration_in_minutes,
                 )
             }
             None => {
                 println!("{}", "The 'Statement Summary Tables' are disabled; when they are available, estimations can be more accurate.".bold().yellow());
-                println!("{}", "See https://docs.pingcap.com/tidb/stable/statement-summary-tables#parameter-configuration".bold().yellow());
+                println!("{}", "For detailed instruction, visit https://docs.pingcap.com/tidb/stable/statement-summary-tables#parameter-configuration".bold().yellow());
                 (metrics.write_bytes_per_hour, 0)
             }
         };
@@ -110,7 +131,7 @@ pub async fn load_workload_description(
         }
     } else {
         if !is_mysql_performance_schema_enabled(&pool).await? {
-            return Err(anyhow!("Please enable performance schema on your MySQL Server. See: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"));
+            return Err(anyhow!("Please enable the 'Performance Schema' on your MySQL server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"));
         }
         Ok(WorkloadDescription::mysql(
             tables,
@@ -141,7 +162,7 @@ async fn read_tables_information(pool: &Pool<MySql>, database: &str) -> Result<T
         .bind(database).fetch_one(pool).await?)
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct MySQLStatementsSummary {
     read_requests: u64,
     read_rows: u64,

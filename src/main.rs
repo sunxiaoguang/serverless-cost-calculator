@@ -130,11 +130,19 @@ async fn main() {
             );
             let mut table = Table::new();
             table.set_titles(row![bFg -> "SKU", bFgr -> "Cost"]);
-            table.add_row(row![bFg -> "Row-based Storage", bFgr -> format!("${}", Float::from_2(estimation.storage_cost))]);
             table.add_row(row![bFg -> "Request Units", bFgr -> format!("${}", Float::from_2(estimation.request_units_cost))]);
+            table.add_row(row![bFg -> "Row-based Storage", bFgr -> format!("${}", Float::from_2(estimation.storage_cost))]);
             table.add_row(row![bFg -> "Free Credits", bFgr -> format!("-${}", Float::from_2(estimation.free_credit))]);
             table.add_row(row![bFg -> "Total", bFgr -> total]);
             table.printstd();
         }
     }
+
+    println!("\n{}", "Notes:".bold().green());
+    println!("{}", "* Request units are estimated based on statistical data from the past, up to seven days. Be cautious: severe fluctuations in recent workload, such as ingesting a large volume of data, can skew the final estimation.".bold().green());
+    println!("{}", "* The storage size is estimated from statistical data, which differs from the actual data size.".bold().green());
+    println!("{}", "* TiDB Serverless encodes data differently from MySQL, resulting in slightly different storage consumption.".bold().green());
+    println!("{}", "* The TiDB Serverless storage size meter does not account for data compression or replicas.".bold().green());
+    println!("{}", "* For detailed pricing information, visit https://www.pingcap.com/tidb-serverless-pricing-details".bold().green());
+    println!("{}", "* For additional questions, refer to the FAQs on https://docs.pingcap.com/tidbcloud/serverless-faqs".bold().green());
 }
