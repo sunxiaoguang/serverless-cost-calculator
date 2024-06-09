@@ -2,6 +2,11 @@
 name = "serverless-cost-calculator"
 version = "0.1.0"
 edition = "2021"
+authors = ["Xiaoguang Sun <sunxiaoguang@gmail.com>"]
+license = "Apache-2.0"
+description = "Estimate the cost of TiDB Serverless for your existing MySQL-compatible databases."
+homepage = "https://github.com/sunxiaoguang/serverless-cost-calculator"
+repository = "https://github.com/sunxiaoguang/serverless-cost-calculator"
 
 [dependencies]
 clap = "4.5.6"
