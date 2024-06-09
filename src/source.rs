@@ -24,7 +24,12 @@ impl WorkloadDescription {
     fn mysql(tables: TablesInformation, summary: MySQLStatementsSummary) -> Self {
         let duration_in_minutes =
             max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
-        let minutes_per_hour = 60 * 24;
+        let minutes_per_hour= 60;
+        if duration_in_minutes < minutes_per_hour {
+            println!("{}", format!("The statement summary, covering only {} minute(s), is less than an hour's workload. It is highly recommended to collect at least a day's worth of data before running the estimation to prevent distortion.", duration_in_minutes).bold().red());
+        } else if duration_in_minutes < minutes_per_hour * 24 {
+            println!("{}", format!("The statement summary, covering only {} hour(s), is less than a full day's workload and may not reflect the full business. Consider running the tool after collecting data for a longer period to ensure accuracy.", duration_in_minutes / minutes_per_hour).bold().yellow());
+        }
         let total_storage_in_bytes = tables.total_index_in_bytes + tables.total_data_in_bytes;
         let average_row_size_in_bytes = total_storage_in_bytes / tables.total_rows;
         let estimated_number_of_regions = total_storage_in_bytes / TARGET_REGION_SIZE;
