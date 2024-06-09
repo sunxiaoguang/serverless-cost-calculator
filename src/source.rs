@@ -8,6 +8,7 @@ use regex::Regex;
 use sqlx::{FromRow, MySql, Pool};
 
 const TARGET_REGION_SIZE: u64 = 256 * 1024 * 1024;
+const MINUTES_PER_HOUR: u64 = 60;
 
 #[derive(Default, Debug)]
 pub struct WorkloadDescription {
@@ -21,22 +22,24 @@ pub struct WorkloadDescription {
 }
 
 impl WorkloadDescription {
+    fn check_summary_duration(duration_in_minutes: u64) {
+        if duration_in_minutes < MINUTES_PER_HOUR {
+            println!("{}", format!("The statement summary, covering only {} minute(s), is less than an hour's workload. It is highly recommended to collect at least a day's worth of data before running the estimation to prevent distortion.", duration_in_minutes).bold().red());
+        } else if duration_in_minutes < MINUTES_PER_HOUR * 24 {
+            println!("{}", format!("The statement summary, covering only {} hour(s), is less than a full day's workload and may not reflect the full business. Consider running the tool after collecting data for a longer period to ensure accuracy.", duration_in_minutes / MINUTES_PER_HOUR).bold().yellow());
+        }
+    }
     fn mysql(tables: TablesInformation, summary: MySQLStatementsSummary) -> Self {
         let duration_in_minutes =
             max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
-        let minutes_per_hour= 60;
-        if duration_in_minutes < minutes_per_hour {
-            println!("{}", format!("The statement summary, covering only {} minute(s), is less than an hour's workload. It is highly recommended to collect at least a day's worth of data before running the estimation to prevent distortion.", duration_in_minutes).bold().red());
-        } else if duration_in_minutes < minutes_per_hour * 24 {
-            println!("{}", format!("The statement summary, covering only {} hour(s), is less than a full day's workload and may not reflect the full business. Consider running the tool after collecting data for a longer period to ensure accuracy.", duration_in_minutes / minutes_per_hour).bold().yellow());
-        }
+        Self::check_summary_duration(duration_in_minutes);
         let total_storage_in_bytes = tables.total_index_in_bytes + tables.total_data_in_bytes;
         let average_row_size_in_bytes = total_storage_in_bytes / tables.total_rows;
         let estimated_number_of_regions = total_storage_in_bytes / TARGET_REGION_SIZE;
 
         let read_bytes_per_hour =
-            minutes_per_hour * average_row_size_in_bytes * summary.read_rows / duration_in_minutes;
-        let read_requests_per_hour = minutes_per_hour * summary.read_requests / duration_in_minutes;
+            MINUTES_PER_HOUR * average_row_size_in_bytes * summary.read_rows / duration_in_minutes;
+        let read_requests_per_hour = MINUTES_PER_HOUR * summary.read_requests / duration_in_minutes;
         let read_bytes_per_request = read_bytes_per_hour / read_requests_per_hour;
         let read_regions_per_request = max(
             read_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
@@ -44,9 +47,9 @@ impl WorkloadDescription {
         );
 
         let write_bytes_per_hour =
-            minutes_per_hour * average_row_size_in_bytes * summary.write_rows / duration_in_minutes;
+            MINUTES_PER_HOUR * average_row_size_in_bytes * summary.write_rows / duration_in_minutes;
         let write_requests_per_hour =
-            minutes_per_hour * summary.write_queries / duration_in_minutes;
+            MINUTES_PER_HOUR * summary.write_queries / duration_in_minutes;
         let write_bytes_per_request = write_bytes_per_hour / write_requests_per_hour;
         let write_regions_per_request = max(
             write_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
@@ -58,7 +61,7 @@ impl WorkloadDescription {
             read_bytes_per_hour,
             write_requests_per_hour: write_requests_per_hour * write_regions_per_request,
             write_bytes_per_hour,
-            sent_bytes_per_hour: minutes_per_hour * average_row_size_in_bytes * summary.sent_rows
+            sent_bytes_per_hour: MINUTES_PER_HOUR * average_row_size_in_bytes * summary.sent_rows
                 / duration_in_minutes,
             total_data_in_bytes: tables.total_data_in_bytes,
             total_index_in_bytes: tables.total_index_in_bytes,
@@ -74,12 +77,12 @@ impl WorkloadDescription {
             Some(summary) => {
                 let duration_in_minutes =
                     max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
-                let minutes_per_hour = 60 * 24;
+                Self::check_summary_duration(duration_in_minutes);
                 let average_row_size_in_bytes =
                     (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
                 (
-                    minutes_per_hour * summary.write_bytes / duration_in_minutes,
-                    minutes_per_hour * summary.sent_rows * average_row_size_in_bytes
+                    MINUTES_PER_HOUR * summary.write_bytes / duration_in_minutes,
+                    MINUTES_PER_HOUR * summary.sent_rows * average_row_size_in_bytes
                         / duration_in_minutes,
                 )
             }
@@ -99,14 +102,6 @@ impl WorkloadDescription {
             total_index_in_bytes: tables.total_index_in_bytes,
         }
     }
-
-    fn tidb_serverless(tables: TablesInformation) -> Self {
-        WorkloadDescription {
-            total_data_in_bytes: tables.total_data_in_bytes,
-            total_index_in_bytes: tables.total_index_in_bytes,
-            ..Default::default() /* there is no metric for network egress */
-        }
-    }
 }
 
 pub async fn load_workload_description(
@@ -115,7 +110,7 @@ pub async fn load_workload_description(
     user: String,
     password: String,
     database: String,
-) -> Result<WorkloadDescription> {
+) -> Result<Option<WorkloadDescription>> {
     let connection_string = format!(
         "mysql://{}:{}@{}:{}/{}",
         user, password, host, port, database
@@ -125,27 +120,25 @@ pub async fn load_workload_description(
     let tables = read_tables_information(&pool, &database).await?;
     if is_tidb(&pool).await? {
         if is_tidb_serverless(&pool).await? {
-            // tidb serverless does not expose metrics and statements summary from SQL. Can only estimate storage cost
-            Ok(WorkloadDescription::tidb_serverless(tables))
+            Ok(None)
         } else {
-            Ok(WorkloadDescription::tidb(
+            Ok(Some(WorkloadDescription::tidb(
                 tables,
                 read_tidb_statements_summary(&pool, &database).await?,
                 read_tidb_system_metrics(&pool).await?,
-            ))
+            )))
         }
-    } else {
-        if !is_mysql_performance_schema_enabled(&pool).await? {
-            return Err(anyhow!("Please enable the 'Performance Schema' on your MySQL server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"));
-        }
-        Ok(WorkloadDescription::mysql(
+    } else if is_mysql_performance_schema_enabled(&pool).await? {
+        Ok(Some(WorkloadDescription::mysql(
             tables,
             read_mysql_statements_summary(&pool, &database).await?,
-        ))
+        )))
+    } else {
+        Err(anyhow!("Please enable the 'Performance Schema' on your MySQL server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"))
     }
 }
 
-#[derive(FromRow)]
+#[derive(Debug, FromRow)]
 struct TablesInformation {
     total_rows: u64,
     total_data_in_bytes: u64,
@@ -240,7 +233,7 @@ async fn read_mysql_statements_summary(
     ))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct TiDBStatementsSummary {
     read_requests: u64,
     read_rows: u64,
@@ -269,7 +262,7 @@ struct TiDBStatementSummary {
     last_seen: DateTime<Utc>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct TiDBSystemMetrics {
     write_bytes_per_hour: u64,
     write_requests_per_hour: u64,
@@ -286,7 +279,7 @@ async fn read_tidb_system_metrics(pool: &Pool<MySql>) -> Result<TiDBSystemMetric
 
     loop {
         let (start, end): (String, String) = sqlx::query_as(
-            "select CAST(DATE_SUB(NOW(), INTERVAL ? DAY) AS CHAR), CAST(NOW() AS CHAR)",
+            "SELECT CAST(DATE_SUB(NOW(), INTERVAL ? DAY) AS CHAR), CAST(NOW() AS CHAR)",
         )
         .bind(interval)
         .fetch_one(pool)
@@ -336,8 +329,10 @@ async fn read_tidb_statements_summary(
         return Ok(None);
     }
     let statements_summary: Vec<TiDBStatementSummary> =
-        sqlx::query_as("SELECT STMT_TYPE, DIGEST_TEXT, EXEC_COUNT, AVG_AFFECTED_ROWS, CAST(AVG_RESULT_ROWS AS UNSIGNED) AS AVG_RESULT_ROWS, AVG_PROCESSED_KEYS, CAST(AVG_WRITE_SIZE AS UNSIGNED) AS AVG_WRITE_SIZE, FIRST_SEEN, LAST_SEEN FROM information_schema.CLUSTER_STATEMENTS_SUMMARY WHERE SCHEMA_NAME=? AND LAST_SEEN >= DATE_SUB(NOW(), INTERVAL 7 DAY)")
-            .bind(database).fetch_all(pool).await?;
+        sqlx::query_as(
+            "SELECT STMT_TYPE, DIGEST_TEXT, EXEC_COUNT, AVG_AFFECTED_ROWS, CAST(AVG_RESULT_ROWS AS UNSIGNED) AS AVG_RESULT_ROWS, AVG_PROCESSED_KEYS, CAST(AVG_WRITE_SIZE AS UNSIGNED) AS AVG_WRITE_SIZE, FIRST_SEEN, LAST_SEEN FROM information_schema.CLUSTER_STATEMENTS_SUMMARY WHERE SCHEMA_NAME=? AND LAST_SEEN >= DATE_SUB(NOW(), INTERVAL 7 DAY) UNION ALL SELECT STMT_TYPE, DIGEST_TEXT, EXEC_COUNT, AVG_AFFECTED_ROWS, CAST(AVG_RESULT_ROWS AS UNSIGNED) AS AVG_RESULT_ROWS, AVG_PROCESSED_KEYS, CAST(AVG_WRITE_SIZE AS UNSIGNED) AS AVG_WRITE_SIZE, FIRST_SEEN, LAST_SEEN FROM information_schema.CLUSTER_STATEMENTS_SUMMARY_HISTORY WHERE SCHEMA_NAME=? AND LAST_SEEN >= DATE_SUB(NOW(), INTERVAL 7 DAY)"
+        )
+            .bind(database).bind(database).fetch_all(pool).await?;
     let now = Utc::now();
     let seven_days_ago = now.sub(Duration::days(7));
     if statements_summary.is_empty() {

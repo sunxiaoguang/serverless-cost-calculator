@@ -97,14 +97,22 @@ async fn main() {
         database.bold().green()
     );
 
-    let workload =
-        match source::load_workload_description(host, port, user, password, database).await {
-            Err(e) => {
-                println!("{}", format!("The workload failed to load: {}", e).red());
-                return;
-            }
-            Ok(workload) => workload,
-        };
+    let workload = match source::load_workload_description(host, port, user, password, database)
+        .await
+    {
+        Err(e) => {
+            println!(
+                "{}",
+                format!("The workload failed to load: {}", e).bold().red()
+            );
+            return;
+        }
+        Ok(Some(workload)) => workload,
+        Ok(None) => {
+            println!("{}", "You are already using TiDB Serverless. Please check your billing in the TiDB Cloud Console for charges. For more information, visit https://docs.pingcap.com/tidbcloud/tidb-cloud-billing".bold().green());
+            return;
+        }
+    };
     match calculator::estimate(region.as_str(), workload) {
         Err(e) => {
             println!("{}", format!("The cost estimation failed: {}", e).red());
