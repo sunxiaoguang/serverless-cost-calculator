@@ -1,104 +1,109 @@
 mod calculator;
 mod source;
-use clap::{value_parser, Arg, Command};
+use clap::{ArgAction, Parser};
 use colored::*;
 use prettytable::{row, Table};
 use readable::num::*;
-
+#[derive(Parser)]
+#[command(
+    name = "TiDB Serverless Cost Calculator",
+    version,
+    arg_required_else_help(true),
+    disable_help_flag(true),
+    about = "Estimate the cost of TiDB Serverless for your existing MySQL-compatible databases."
+)]
+struct CalculatorOptions {
+    #[arg(
+        id = "host",
+        short = 'h',
+        long = "host",
+        env = "DB_HOST",
+        default_value = "localhost",
+        help = "Sets the host for the MySQL server",
+        num_args(1)
+    )]
+    host: String,
+    #[arg(
+        id = "port",
+        short = 'P',
+        long = "port",
+        env = "DB_PORT",
+        default_value_t = 3306,
+        help = "Sets the port for the MySQL server",
+        num_args(1)
+    )]
+    port: u16,
+    #[arg(
+        id = "user",
+        short = 'u',
+        long = "user",
+        env = "DB_USERNAME",
+        default_value = "root",
+        help = "Sets the username for the MySQL server",
+        num_args(1)
+    )]
+    user: String,
+    #[arg(
+        id = "password",
+        short = 'p',
+        long = "password",
+        env = "DB_PASSWORD",
+        default_value = "",
+        help = "Sets the password for the MySQL server",
+        num_args(1)
+    )]
+    password: String,
+    #[arg(
+        id = "database",
+        short = 'D',
+        long = "database",
+        env = "DB_DATABASE",
+        help = "Sets the database for the MySQL server",
+        num_args(1),
+        required(true)
+    )]
+    database: String,
+    #[arg(
+        id = "region",
+        short = 'r',
+        long = "region",
+        env = "SERVERLESS_REGION",
+        default_value = "us-east-1",
+        help = "AWS Region of the TiDB Serverless cluster",
+        num_args(1)
+    )]
+    region: String,
+    #[arg(
+        id = "analyze",
+        short = 'a',
+        long = "analyze",
+        env = "DB_ANALYZE",
+        action = ArgAction::SetTrue,
+        default_value_t = false,
+        help = "Run ANALYZE before reading system tables depending on statistics data",
+    )]
+    analyze: bool,
+}
 #[tokio::main]
 async fn main() {
-    let matches = Command::new("TiDB Serverless Cost Calculator")
-        .version("0.1.0")
-        .about("Estimate the cost of TiDB Serverless for your existing MySQL-compatible databases.")
-        .arg_required_else_help(true)
-        .disable_help_flag(true)
-        .arg(
-            Arg::new("host")
-                .short('h')
-                .long("host")
-                .value_name("HOST")
-                .default_value("localhost")
-                .help("Sets the host for the MySQL server")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("port")
-                .short('P')
-                .long("port")
-                .value_name("PORT")
-                .default_value("3306")
-                .value_parser(value_parser!(u16))
-                .help("Sets the port for the MySQL server")
-                .num_args(1)
-                .default_value("3306"), // Default MySQL port
-        )
-        .arg(
-            Arg::new("user")
-                .short('u')
-                .long("user")
-                .value_name("USER")
-                .default_value("root")
-                .num_args(1)
-                .help("Sets the username for the MySQL server"),
-        )
-        .arg(
-            Arg::new("password")
-                .short('p')
-                .long("password")
-                .value_name("PASSWORD")
-                .default_value("")
-                .num_args(1)
-                .help("Sets the password for the MySQL server"),
-        )
-        .arg(
-            Arg::new("database")
-                .short('d')
-                .long("database")
-                .num_args(1)
-                .value_name("DATABASE")
-                .help("Sets the database to connect to")
-                .required(true),
-        )
-        .arg(
-            Arg::new("region")
-                .short('r')
-                .long("region")
-                .value_name("REGION")
-                .default_value("us-east-1")
-                .num_args(1)
-                .help("AWS Region of the new TiDB Serverless cluster"),
-        )
-        .get_matches();
-
-    // Extract the values from the command line arguments
-    let host = matches
-        .get_one::<String>("host")
-        .expect("`host` is required")
-        .to_owned();
-    let port: u16 = *matches.get_one("port").expect("`port` is required");
-    let user = matches
-        .get_one::<String>("user")
-        .expect("`user` is required")
-        .to_owned();
-    let password = matches.get_one::<String>("password").unwrap().to_owned();
-    let database = matches
-        .get_one::<String>("database")
-        .expect("`database` is required")
-        .to_owned();
-    let region = matches
-        .get_one::<String>("region")
-        .expect("`region` is required")
-        .to_owned();
+    let options = CalculatorOptions::parse();
 
     println!(
         "Connecting to the MySQL compatible database at '{}' as the user '{}' using the database '{}'",
-        format!("{}:{}", host, port).bold().green(),
-        user.bold().green(),
-        database.bold().green()
+        format!("{}:{}", options.host, options.port).bold().green(),
+        options.user.bold().green(),
+        options.database.bold().green()
     );
 
-    let workload = match source::load_workload_description(host, port, user, password, database)
-        .await
+    let workload = match source::load_workload_description(
+        &options.host,
+        options.port,
+        &options.user,
+        &options.password,
+        &options.database,
+        options.analyze,
+    )
+    .await
     {
         Err(e) => {
             println!(
@@ -113,7 +118,7 @@ async fn main() {
             return;
         }
     };
-    match calculator::estimate(region.as_str(), workload) {
+    match calculator::estimate(&options.region, workload) {
         Err(e) => {
             println!("{}", format!("The cost estimation failed: {}", e).red());
             return;

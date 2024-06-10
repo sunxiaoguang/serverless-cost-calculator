@@ -1,4 +1,6 @@
 use std::cmp::{max, min};
+use std::io;
+use std::io::Write;
 use std::ops::Sub;
 
 use anyhow::{anyhow, Result};
@@ -114,12 +116,45 @@ impl WorkloadDescription {
     }
 }
 
+async fn run_analyze(pool: &Pool<MySql>) -> Result<()> {
+    let tables: Vec<String> = sqlx::query_as("SHOW TABLES")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|v: (String,)| v.0)
+        .collect();
+    for table in tables {
+        println!("{}", format!("Analyzing table `{}`. Press CTRL+C to terminate if you notice unexpected performance impacts on the production system.", table).bold().yellow());
+        sqlx::query(&format!("ANALYZE TABLE `{}`", table))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn confirm_and_run_analyze(pool: &Pool<MySql>) -> Result<()> {
+    loop {
+        print!("{}", "Running ANALYZE on the production system may affect ongoing queries. Do you want to proceed? (yes/no): ".bold().yellow());
+        io::stdout().flush().unwrap_or(());
+        let mut confirmation = String::new();
+        io::stdin().read_line(&mut confirmation)?;
+        let confirmation = confirmation.trim().to_lowercase();
+        match confirmation.as_str() {
+            "yes" => break,
+            "no" => return Ok(()),
+            _ => continue,
+        }
+    }
+    run_analyze(pool).await
+}
+
 pub async fn load_workload_description(
-    host: String,
+    host: &str,
     port: u16,
-    user: String,
-    password: String,
-    database: String,
+    user: &str,
+    password: &str,
+    database: &str,
+    analyze_before_start: bool,
 ) -> Result<Option<WorkloadDescription>> {
     let connection_string = format!(
         "mysql://{}:{}@{}:{}/{}",
@@ -127,21 +162,25 @@ pub async fn load_workload_description(
     );
     let pool = sqlx::MySqlPool::connect(&connection_string).await?;
 
-    let tables = read_tables_information(&pool, &database).await?;
+    if analyze_before_start {
+        confirm_and_run_analyze(&pool).await?
+    }
+
+    let tables = read_tables_information(&pool, database).await?;
     if is_tidb(&pool).await? {
         if is_tidb_serverless(&pool).await? {
             Ok(None)
         } else {
             Ok(Some(WorkloadDescription::tidb(
                 tables,
-                read_tidb_statements_summary(&pool, &database).await?,
+                read_tidb_statements_summary(&pool, database).await?,
                 read_tidb_system_metrics(&pool).await?,
             )))
         }
     } else if is_mysql_performance_schema_enabled(&pool).await? {
         Ok(Some(WorkloadDescription::mysql(
             tables,
-            read_mysql_statements_summary(&pool, &database).await?,
+            read_mysql_statements_summary(&pool, database).await?,
         )))
     } else if is_mariadb(&pool).await? {
         Err(anyhow!("Please enable the 'Performance Schema' on your MariaDB server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://mariadb.com/kb/en/performance-schema-overview/#activating-the-performance-schema"))
