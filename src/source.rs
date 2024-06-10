@@ -45,32 +45,32 @@ impl WorkloadDescription {
 
         let read_bytes_per_hour =
             MINUTES_PER_HOUR * average_row_size_in_bytes * summary.read_rows / duration_in_minutes;
-        let read_requests_per_hour = max(
-            MINUTES_PER_HOUR * summary.read_requests / duration_in_minutes,
+        let read_queries_per_hour = max(
+            MINUTES_PER_HOUR * summary.read_queries / duration_in_minutes,
             1,
         );
-        let read_bytes_per_request = read_bytes_per_hour / read_requests_per_hour;
-        let read_regions_per_request = max(
+        let read_bytes_per_request = read_bytes_per_hour / read_queries_per_hour;
+        let read_regions_per_query = max(
             read_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
             1,
         );
 
         let write_bytes_per_hour =
             MINUTES_PER_HOUR * average_row_size_in_bytes * summary.write_rows / duration_in_minutes;
-        let write_requests_per_hour = max(
+        let write_queries_per_hour = max(
             MINUTES_PER_HOUR * summary.write_queries / duration_in_minutes,
             1,
         );
-        let write_bytes_per_request = write_bytes_per_hour / write_requests_per_hour;
-        let write_regions_per_request = max(
-            write_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
+        let write_bytes_per_query = write_bytes_per_hour / write_queries_per_hour;
+        let write_regions_per_query = max(
+            write_bytes_per_query * estimated_number_of_regions / total_storage_in_bytes,
             1,
         );
 
         WorkloadDescription {
-            read_requests_per_hour: read_requests_per_hour * read_regions_per_request,
+            read_requests_per_hour: read_queries_per_hour * read_regions_per_query,
             read_bytes_per_hour,
-            write_requests_per_hour: write_requests_per_hour * write_regions_per_request,
+            write_requests_per_hour: write_queries_per_hour * write_regions_per_query,
             write_bytes_per_hour,
             sent_bytes_per_hour: MINUTES_PER_HOUR * average_row_size_in_bytes * summary.sent_rows
                 / duration_in_minutes,
@@ -213,7 +213,7 @@ async fn read_tables_information(pool: &Pool<MySql>, database: &str) -> Result<T
 
 #[derive(Default, Debug)]
 struct MySQLStatementsSummary {
-    read_requests: u64,
+    read_queries: u64,
     read_rows: u64,
     sent_rows: u64,
     write_queries: u64,
@@ -277,7 +277,7 @@ async fn read_mysql_statements_summary(
             if is_write_pattern.find(&statement.sql).is_some() {
                 acc.write_queries += statement.count;
             } else {
-                acc.read_requests += statement.count;
+                acc.read_queries += statement.count;
             }
             acc
         },
@@ -286,7 +286,7 @@ async fn read_mysql_statements_summary(
 
 #[derive(Debug, Default)]
 struct TiDBStatementsSummary {
-    read_requests: u64,
+    read_queries: u64,
     read_rows: u64,
     sent_rows: u64,
     write_queries: u64,
@@ -411,7 +411,7 @@ async fn read_tidb_statements_summary(
             ) {
                 acc.write_queries += statement.count;
             } else {
-                acc.read_requests += statement.count;
+                acc.read_queries += statement.count;
             }
             acc
         },
