@@ -16,14 +16,12 @@ The `serverless-cost-calculator` is an application that estimates the monthly co
 - Cargo (Rust's package manager, included with Rust)
 - MySQL-compatible database server (MySQL or TiDB)
 
-## Building the Tool
+## Building from source
 
-To build the `serverless-cost-calculator`, clone the repository and build it using Cargo:
+You can use cargo to build everything:
 
 ```sh
-git clone https://github.com/sunxiaoguang/serverless-cost-calculator.git
-cd serverless-cost-calculator
-cargo build --release
+cargo install serverless-cost-calculator
 ```
 
 ## Usage
@@ -31,19 +29,19 @@ cargo build --release
 After building the tool, you can run it using the following command:
 
 ```sh
-./target/release/serverless-cost-calculator --database <DATABASE> --region <REGION>
+serverless-cost-calculator --database <DATABASE> --region <REGION>
 ```
 
 Where:
 - `<DATABASE>` is the name of the database you want to estimate.
 - `<REGION>` is the AWS region for the TiDB Serverless cluster.
 
-You can also specify the host, port, user, and password for your MySQL server using the respective flags.
+You can also specify the host, port, user, password and analyze for your MySQL server using the respective flags.
 
 ### Example
 
 ```sh
-./target/release/serverless-cost-calculator --database mydb --host localhost --port 3306 --user root --password abcxyz --region us-east-1
+serverless-cost-calculator --database mydb --host localhost --port 3306 --user root --password abcxyz --region us-east-1 --analyze
 ```
 
 ## Output
