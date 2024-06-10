@@ -35,14 +35,14 @@ fn calculate(
 
 fn estimate_usage(workload: WorkloadDescription) -> WorkloadUsage {
     let read_request_units_per_hour =
-        workload.read_requests_per_hour / 8 + workload.read_bytes_per_hour / (64 * KILO);
+        (workload.read_requests_per_hour / 8) + (workload.read_bytes_per_hour / (64 * KILO));
     let write_request_units_per_hour =
-        (workload.write_requests_per_hour + workload.write_bytes_per_hour / KILO) * 3;
+        (workload.write_requests_per_hour + (workload.write_bytes_per_hour / KILO)) * 3;
     let request_units_per_hour = read_request_units_per_hour + write_request_units_per_hour;
     WorkloadUsage {
         row_based_storage_in_mib: (workload.total_data_in_bytes + workload.total_index_in_bytes)
             / MEGA,
-        network_egress_in_mib: workload.sent_bytes_per_hour / MEGA,
+        network_egress_in_mib: workload.sent_bytes_per_hour * HOURS_PER_MONTH / MEGA,
         request_units_in_million: request_units_per_hour * HOURS_PER_MONTH / MEGA,
     }
 }
