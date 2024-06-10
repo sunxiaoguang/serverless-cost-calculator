@@ -33,13 +33,20 @@ impl WorkloadDescription {
         let duration_in_minutes =
             max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
         Self::check_summary_duration(duration_in_minutes);
-        let total_storage_in_bytes = tables.total_index_in_bytes + tables.total_data_in_bytes;
-        let average_row_size_in_bytes = total_storage_in_bytes / tables.total_rows;
+        let total_storage_in_bytes = max(
+            tables.total_index_in_bytes.unwrap_or(0) + tables.total_data_in_bytes.unwrap_or(0),
+            1,
+        );
+        let average_row_size_in_bytes =
+            total_storage_in_bytes / max(tables.total_rows.unwrap_or(0), 1);
         let estimated_number_of_regions = total_storage_in_bytes / TARGET_REGION_SIZE;
 
         let read_bytes_per_hour =
             MINUTES_PER_HOUR * average_row_size_in_bytes * summary.read_rows / duration_in_minutes;
-        let read_requests_per_hour = MINUTES_PER_HOUR * summary.read_requests / duration_in_minutes;
+        let read_requests_per_hour = max(
+            MINUTES_PER_HOUR * summary.read_requests / duration_in_minutes,
+            1,
+        );
         let read_bytes_per_request = read_bytes_per_hour / read_requests_per_hour;
         let read_regions_per_request = max(
             read_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
@@ -48,8 +55,10 @@ impl WorkloadDescription {
 
         let write_bytes_per_hour =
             MINUTES_PER_HOUR * average_row_size_in_bytes * summary.write_rows / duration_in_minutes;
-        let write_requests_per_hour =
-            MINUTES_PER_HOUR * summary.write_queries / duration_in_minutes;
+        let write_requests_per_hour = max(
+            MINUTES_PER_HOUR * summary.write_queries / duration_in_minutes,
+            1,
+        );
         let write_bytes_per_request = write_bytes_per_hour / write_requests_per_hour;
         let write_regions_per_request = max(
             write_bytes_per_request * estimated_number_of_regions / total_storage_in_bytes,
@@ -63,8 +72,8 @@ impl WorkloadDescription {
             write_bytes_per_hour,
             sent_bytes_per_hour: MINUTES_PER_HOUR * average_row_size_in_bytes * summary.sent_rows
                 / duration_in_minutes,
-            total_data_in_bytes: tables.total_data_in_bytes,
-            total_index_in_bytes: tables.total_index_in_bytes,
+            total_data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
+            total_index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
         }
     }
 
@@ -78,8 +87,9 @@ impl WorkloadDescription {
                 let duration_in_minutes =
                     max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
                 Self::check_summary_duration(duration_in_minutes);
-                let average_row_size_in_bytes =
-                    (tables.total_index_in_bytes + tables.total_data_in_bytes) / tables.total_rows;
+                let average_row_size_in_bytes = (tables.total_index_in_bytes.unwrap_or(0)
+                    + tables.total_data_in_bytes.unwrap_or(0))
+                    / max(1, tables.total_rows.unwrap_or(0));
                 (
                     MINUTES_PER_HOUR * summary.write_bytes / duration_in_minutes,
                     MINUTES_PER_HOUR * summary.sent_rows * average_row_size_in_bytes
@@ -98,8 +108,8 @@ impl WorkloadDescription {
             write_requests_per_hour: metrics.write_requests_per_hour,
             write_bytes_per_hour,
             sent_bytes_per_hour,
-            total_data_in_bytes: tables.total_data_in_bytes,
-            total_index_in_bytes: tables.total_index_in_bytes,
+            total_data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
+            total_index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
         }
     }
 }
@@ -133,6 +143,8 @@ pub async fn load_workload_description(
             tables,
             read_mysql_statements_summary(&pool, &database).await?,
         )))
+    } else if is_mariadb(&pool).await? {
+        Err(anyhow!("Please enable the 'Performance Schema' on your MariaDB server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://mariadb.com/kb/en/performance-schema-overview/#activating-the-performance-schema"))
     } else {
         Err(anyhow!("Please enable the 'Performance Schema' on your MySQL server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://dev.mysql.com/doc/refman/5.7/en/performance-schema-startup-configuration.html"))
     }
@@ -140,9 +152,9 @@ pub async fn load_workload_description(
 
 #[derive(Debug, FromRow)]
 struct TablesInformation {
-    total_rows: u64,
-    total_data_in_bytes: u64,
-    total_index_in_bytes: u64,
+    total_rows: Option<u64>,
+    total_data_in_bytes: Option<u64>,
+    total_index_in_bytes: Option<u64>,
 }
 
 async fn check_variable_value(pool: &Pool<MySql>, variable: &str, value: &str) -> Result<bool> {
@@ -367,15 +379,23 @@ async fn read_tidb_statements_summary(
     )))
 }
 
-async fn is_tidb(pool: &Pool<MySql>) -> Result<bool> {
+async fn check_version_signature(pool: &Pool<MySql>, pattern: &str) -> Result<bool> {
     let version: (String,) = sqlx::query_as("SELECT version()").fetch_one(pool).await?;
-    let is_tidb_pattern = Regex::new("^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-.*")?;
-    Ok(is_tidb_pattern.find(&version.0).is_some())
+    Ok(Regex::new(pattern)?.find(&version.0).is_some())
+}
+
+async fn is_tidb(pool: &Pool<MySql>) -> Result<bool> {
+    check_version_signature(pool, "^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-.*").await
 }
 
 async fn is_tidb_serverless(pool: &Pool<MySql>) -> Result<bool> {
-    let version: (String,) = sqlx::query_as("SELECT version()").fetch_one(pool).await?;
-    let is_tidb_serverless_pattern =
-        Regex::new("^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-v\\d+\\.\\d+\\.\\d+-(?i)serverless(?-i).*")?;
-    Ok(is_tidb_serverless_pattern.find(&version.0).is_some())
+    check_version_signature(
+        pool,
+        "^\\d+\\.\\d+\\.\\d+-(?i)TiDB(?-i)-v\\d+\\.\\d+\\.\\d+-(?i)serverless(?-i).*",
+    )
+    .await
+}
+
+async fn is_mariadb(pool: &Pool<MySql>) -> Result<bool> {
+    check_version_signature(pool, "^\\d+\\.\\d+\\.\\d+-(?i)MariaDB(?-i)-.*").await
 }
