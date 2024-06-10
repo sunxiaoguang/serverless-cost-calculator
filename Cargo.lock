@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "serverless-cost-calculator"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",

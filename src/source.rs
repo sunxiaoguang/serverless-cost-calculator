@@ -117,11 +117,11 @@ impl WorkloadDescription {
 }
 
 async fn run_analyze(pool: &Pool<MySql>) -> Result<()> {
-    let tables: Vec<String> = sqlx::query_as("SHOW TABLES")
+    let tables: Vec<String> = sqlx::query_as("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
         .fetch_all(pool)
         .await?
         .into_iter()
-        .map(|v: (String,)| v.0)
+        .map(|v: (String, String)| v.0)
         .collect();
     for table in tables {
         println!("{}", format!("Analyzing table `{}`. Press CTRL+C to terminate if you notice unexpected performance impacts on the production system.", table).bold().yellow());
@@ -222,7 +222,7 @@ struct MySQLStatementsSummary {
     end_time: DateTime<Utc>,
 }
 
-#[derive(FromRow)]
+#[derive(FromRow, Debug)]
 struct MySQLStatementSummary {
     #[sqlx(rename = "DIGEST_TEXT")]
     sql: String,
@@ -295,7 +295,7 @@ struct TiDBStatementsSummary {
     end_time: DateTime<Utc>,
 }
 
-#[derive(FromRow)]
+#[derive(FromRow, Debug)]
 struct TiDBStatementSummary {
     #[sqlx(rename = "STMT_TYPE")]
     statement_type: String,
