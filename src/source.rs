@@ -138,8 +138,7 @@ async fn confirm_and_run_analyze(pool: &Pool<MySql>) -> Result<()> {
         io::stdout().flush().unwrap_or(());
         let mut confirmation = String::new();
         io::stdin().read_line(&mut confirmation)?;
-        let confirmation = confirmation.trim().to_lowercase();
-        match confirmation.as_str() {
+        match confirmation.trim().to_lowercase().as_str() {
             "yes" => break,
             "no" => return Ok(()),
             _ => continue,
