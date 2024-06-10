@@ -8,7 +8,7 @@ Estimate the cost of TiDB Serverless for your existing MySQL-compatible database
 
 ## Overview
 
-The `serverless-cost-calculator` is an application that estimates the monthly cost of running MySQL-compatible databases on TiDB Serverless, analyzing your current workload to provide a projected expense.
+The `serverless-cost-calculator` is an application that estimates the monthly cost of running existing workloads on MySQL-compatible databases using TiDB Serverless. It analyzes your current workload to provide a projected expense. As the tool is still in the early stages of development, its estimations may differ substantially in real-world scenarios. If you encounter any problems or unexpected estimations, please feel free to report them.
 
 ## Prerequisites
 
