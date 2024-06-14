@@ -3,38 +3,53 @@ use std::io;
 use std::io::Write;
 use std::ops::Sub;
 
+use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
-use colored::*;
 use regex::Regex;
+use serde::Serialize;
 use sqlx::{FromRow, MySql, Pool};
 
 const TARGET_REGION_SIZE: u64 = 256 * 1024 * 1024;
 const MINUTES_PER_HOUR: u64 = 60;
 
-#[derive(Default, Debug)]
+#[derive(Debug, Default, Serialize)]
+pub struct RequestDescription {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_per_hour: Option<u64>,
+    pub bytes_per_hour: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct StorageDescription {
+    pub data_in_bytes: u64,
+    pub index_in_bytes: u64,
+}
+
+#[derive(Default, Debug, Serialize)]
 pub struct WorkloadDescription {
-    pub read_requests_per_hour: u64,
-    pub read_bytes_per_hour: u64,
-    pub write_requests_per_hour: u64,
-    pub write_bytes_per_hour: u64,
-    pub sent_bytes_per_hour: u64,
-    pub total_data_in_bytes: u64,
-    pub total_index_in_bytes: u64,
+    pub read: RequestDescription,
+    pub write: RequestDescription,
+    pub egress: RequestDescription,
+    pub storage: StorageDescription,
 }
 
 impl WorkloadDescription {
-    fn check_summary_duration(duration_in_minutes: u64) {
+    fn check_summary_duration(output: OutputFormat, duration_in_minutes: u64) {
         if duration_in_minutes < MINUTES_PER_HOUR {
-            println!("{}", format!("The statement summary, covering only {} minute(s), is less than an hour's workload. It is highly recommended to collect at least a day's worth of data before running the estimation to prevent distortion.", duration_in_minutes).bold().red());
+            output.error(&format!("The statement summary, covering only {} minute(s), is less than an hour's workload. It is highly recommended to collect at least a day's worth of data before running the estimation to prevent distortion.", duration_in_minutes));
         } else if duration_in_minutes < MINUTES_PER_HOUR * 24 {
-            println!("{}", format!("The statement summary, covering only {} hour(s), is less than a full day's workload and may not reflect the full business. Consider running the tool after collecting data for a longer period to ensure accuracy.", duration_in_minutes / MINUTES_PER_HOUR).bold().yellow());
+            output.warn(&format!("The statement summary, covering only {} hour(s), is less than a full day's workload and may not reflect the full business. Consider running the tool after collecting data for a longer period to ensure accuracy.", duration_in_minutes / MINUTES_PER_HOUR));
         }
     }
-    fn mysql(tables: TablesInformation, summary: MySQLStatementsSummary) -> Self {
+    fn mysql(
+        output: OutputFormat,
+        tables: TablesInformation,
+        summary: MySQLStatementsSummary,
+    ) -> Self {
         let duration_in_minutes =
             max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
-        Self::check_summary_duration(duration_in_minutes);
+        Self::check_summary_duration(output, duration_in_minutes);
         let total_storage_in_bytes = max(
             tables.total_index_in_bytes.unwrap_or(0) + tables.total_data_in_bytes.unwrap_or(0),
             1,
@@ -68,18 +83,28 @@ impl WorkloadDescription {
         );
 
         WorkloadDescription {
-            read_requests_per_hour: read_queries_per_hour * read_regions_per_query,
-            read_bytes_per_hour,
-            write_requests_per_hour: write_queries_per_hour * write_regions_per_query,
-            write_bytes_per_hour,
-            sent_bytes_per_hour: MINUTES_PER_HOUR * average_row_size_in_bytes * summary.sent_rows
-                / duration_in_minutes,
-            total_data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
-            total_index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
+            read: RequestDescription {
+                requests_per_hour: (read_queries_per_hour * read_regions_per_query).into(),
+                bytes_per_hour: read_bytes_per_hour,
+            },
+            write: RequestDescription {
+                requests_per_hour: (write_queries_per_hour * write_regions_per_query).into(),
+                bytes_per_hour: write_bytes_per_hour,
+            },
+            egress: RequestDescription {
+                bytes_per_hour: MINUTES_PER_HOUR * average_row_size_in_bytes * summary.sent_rows
+                    / duration_in_minutes,
+                ..Default::default()
+            },
+            storage: StorageDescription {
+                data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
+                index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
+            },
         }
     }
 
     fn tidb(
+        output: OutputFormat,
         tables: TablesInformation,
         summary: Option<TiDBStatementsSummary>,
         metrics: TiDBSystemMetrics,
@@ -88,7 +113,7 @@ impl WorkloadDescription {
             Some(summary) => {
                 let duration_in_minutes =
                     max(summary.end_time.sub(summary.start_time).num_minutes(), 1) as u64;
-                Self::check_summary_duration(duration_in_minutes);
+                Self::check_summary_duration(output, duration_in_minutes);
                 let average_row_size_in_bytes = (tables.total_index_in_bytes.unwrap_or(0)
                     + tables.total_data_in_bytes.unwrap_or(0))
                     / max(1, tables.total_rows.unwrap_or(0));
@@ -99,24 +124,33 @@ impl WorkloadDescription {
                 )
             }
             None => {
-                println!("{}", "The 'Statement Summary Tables' are disabled; when they are available, estimations can be more accurate.".bold().yellow());
-                println!("{}", "For detailed instruction, visit https://docs.pingcap.com/tidb/stable/statement-summary-tables#parameter-configuration".bold().yellow());
+                output.warn("The 'Statement Summary Tables' are disabled; when they are available, estimations can be more accurate.");
+                output.warn("For detailed instruction, visit https://docs.pingcap.com/tidb/stable/statement-summary-tables#parameter-configuration");
                 (metrics.write_bytes_per_hour, 0)
             }
         };
         WorkloadDescription {
-            read_requests_per_hour: metrics.read_requests_per_hour,
-            read_bytes_per_hour: metrics.read_bytes_per_hour,
-            write_requests_per_hour: metrics.write_requests_per_hour,
-            write_bytes_per_hour,
-            sent_bytes_per_hour,
-            total_data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
-            total_index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
+            read: RequestDescription {
+                requests_per_hour: metrics.read_requests_per_hour.into(),
+                bytes_per_hour: metrics.read_bytes_per_hour,
+            },
+            write: RequestDescription {
+                requests_per_hour: metrics.write_requests_per_hour.into(),
+                bytes_per_hour: write_bytes_per_hour,
+            },
+            egress: RequestDescription {
+                bytes_per_hour: sent_bytes_per_hour,
+                ..Default::default()
+            },
+            storage: StorageDescription {
+                data_in_bytes: tables.total_data_in_bytes.unwrap_or(0),
+                index_in_bytes: tables.total_index_in_bytes.unwrap_or(0),
+            },
         }
     }
 }
 
-async fn run_analyze(pool: &Pool<MySql>) -> Result<()> {
+async fn run_analyze(output: OutputFormat, pool: &Pool<MySql>) -> Result<()> {
     let tables: Vec<String> = sqlx::query_as("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
         .fetch_all(pool)
         .await?
@@ -124,7 +158,7 @@ async fn run_analyze(pool: &Pool<MySql>) -> Result<()> {
         .map(|v: (String, String)| v.0)
         .collect();
     for table in tables {
-        println!("{}", format!("Analyzing table `{}`. Press CTRL+C to terminate if you notice unexpected performance impacts on the production system.", table).bold().yellow());
+        output.warn(&format!("Analyzing table `{}`. Press CTRL+C to terminate if you notice unexpected performance impacts on the production system.", table));
         sqlx::query(&format!("ANALYZE TABLE `{}`", table))
             .execute(pool)
             .await?;
@@ -132,9 +166,9 @@ async fn run_analyze(pool: &Pool<MySql>) -> Result<()> {
     Ok(())
 }
 
-async fn confirm_and_run_analyze(pool: &Pool<MySql>) -> Result<()> {
+async fn confirm_and_run_analyze(output: OutputFormat, pool: &Pool<MySql>) -> Result<()> {
     loop {
-        print!("{}", "Running ANALYZE on the production system may affect ongoing queries. Do you want to proceed? (yes/no): ".bold().yellow());
+        output.warn("Running ANALYZE on the production system may affect ongoing queries. Do you want to proceed? (yes/no): ");
         io::stdout().flush().unwrap_or(());
         let mut confirmation = String::new();
         io::stdin().read_line(&mut confirmation)?;
@@ -144,10 +178,11 @@ async fn confirm_and_run_analyze(pool: &Pool<MySql>) -> Result<()> {
             _ => continue,
         }
     }
-    run_analyze(pool).await
+    run_analyze(output, pool).await
 }
 
 pub async fn load_workload_description(
+    output: OutputFormat,
     host: &str,
     port: u16,
     user: &str,
@@ -162,7 +197,7 @@ pub async fn load_workload_description(
     let pool = sqlx::MySqlPool::connect(&connection_string).await?;
 
     if analyze_before_start {
-        confirm_and_run_analyze(&pool).await?
+        confirm_and_run_analyze(output, &pool).await?
     }
 
     let tables = read_tables_information(&pool, database).await?;
@@ -171,6 +206,7 @@ pub async fn load_workload_description(
             Ok(None)
         } else {
             Ok(Some(WorkloadDescription::tidb(
+                output,
                 tables,
                 read_tidb_statements_summary(&pool, database).await?,
                 read_tidb_system_metrics(&pool).await?,
@@ -178,6 +214,7 @@ pub async fn load_workload_description(
         }
     } else if is_mysql_performance_schema_enabled(&pool).await? {
         Ok(Some(WorkloadDescription::mysql(
+            output,
             tables,
             read_mysql_statements_summary(&pool, database).await?,
         )))

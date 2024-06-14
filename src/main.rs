@@ -1,9 +1,10 @@
 mod calculator;
+mod output;
 mod source;
+
+use crate::output::OutputFormat;
 use clap::{ArgAction, Parser};
-use colored::*;
-use prettytable::{row, Table};
-use readable::num::*;
+
 #[derive(Parser)]
 #[command(
     name = "TiDB Serverless Cost Calculator",
@@ -83,19 +84,24 @@ struct CalculatorOptions {
         help = "Run ANALYZE before reading system tables depending on statistics data",
     )]
     analyze: bool,
+    #[arg(
+        id = "output",
+        short = 'o',
+        long = "output",
+        env = "OUTPUT",
+        default_value = "human",
+        help = "Output format. One of: json|yaml|human"
+    )]
+    output: OutputFormat,
 }
 #[tokio::main]
 async fn main() {
     let options = CalculatorOptions::parse();
+    let output = options.output;
 
-    println!(
-        "Connecting to the MySQL compatible database at '{}' as the user '{}' using the database '{}'",
-        format!("{}:{}", options.host, options.port).bold().green(),
-        options.user.bold().green(),
-        options.database.bold().green()
-    );
-
+    output.welcome(&options);
     let workload = match source::load_workload_description(
+        output,
         &options.host,
         options.port,
         &options.user,
@@ -106,56 +112,19 @@ async fn main() {
     .await
     {
         Err(e) => {
-            println!(
-                "{}",
-                format!("The workload failed to load: {}", e).bold().red()
-            );
-            return;
+            return output.fatal(&format!("The workload failed to load: {}", e));
         }
         Ok(Some(workload)) => workload,
         Ok(None) => {
-            println!("{}", "You are already using TiDB Serverless. Please check your billing in the TiDB Cloud Console for charges. For more information, visit https://docs.pingcap.com/tidbcloud/tidb-cloud-billing".bold().green());
-            return;
+            return output.info("You are already using TiDB Serverless. Please check your billing in the TiDB Cloud Console for charges. For more information, visit https://docs.pingcap.com/tidbcloud/tidb-cloud-billing");
         }
     };
-    match calculator::estimate(&options.region, workload) {
+    match calculator::estimate(&options.region, &workload) {
         Err(e) => {
-            println!("{}", format!("The cost estimation failed: {}", e).red());
-            return;
+            return output.fatal(&format!("The cost estimation failed: {}", e));
         }
         Ok(estimation) => {
-            let total = if estimation.storage_cost + estimation.request_units_cost
-                <= estimation.free_credit
-            {
-                "$0.00".to_string()
-            } else {
-                format!(
-                    "${}",
-                    Float::from_2(
-                        estimation.storage_cost + estimation.request_units_cost
-                            - estimation.free_credit
-                    )
-                )
-            };
-            println!(
-                "The estimated monthly cost for your workload is {}",
-                total.bold().green()
-            );
-            let mut table = Table::new();
-            table.set_titles(row![bFg -> "SKU", bFgr -> "Cost"]);
-            table.add_row(row![bFg -> "Request Units", bFgr -> format!("${}", Float::from_2(estimation.request_units_cost))]);
-            table.add_row(row![bFg -> "Row-based Storage", bFgr -> format!("${}", Float::from_2(estimation.storage_cost))]);
-            table.add_row(row![bFg -> "Free Credits", bFgr -> format!("-${}", Float::from_2(estimation.free_credit))]);
-            table.add_row(row![bFg -> "Total", bFgr -> total]);
-            table.printstd();
+            output.report(workload, estimation);
         }
     }
-
-    println!("\n{}", "Notes:".bold().green());
-    println!("{}", "* Request units are estimated based on statistical data from the past, up to seven days. Be cautious: severe fluctuations in recent workload, such as ingesting a large volume of data, can skew the final estimation.".bold().green());
-    println!("{}", "* The storage size is estimated from statistical data, which differs from the actual data size.".bold().green());
-    println!("{}", "* TiDB Serverless encodes data differently from MySQL, resulting in slightly different storage consumption.".bold().green());
-    println!("{}", "* The TiDB Serverless storage size meter does not account for data compression or replicas.".bold().green());
-    println!("{}", "* For detailed pricing information, visit https://www.pingcap.com/tidb-serverless-pricing-details".bold().green());
-    println!("{}", "* For additional questions, refer to the FAQs on https://docs.pingcap.com/tidbcloud/serverless-faqs".bold().green());
 }
