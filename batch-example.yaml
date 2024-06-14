@@ -1,0 +1,6 @@
+- database: test
+  port: 4000
+  user: root
+- database: app
+  port: 3306
+  user: root

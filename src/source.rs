@@ -1,17 +1,80 @@
 use std::cmp::{max, min};
+use std::fs::File;
 use std::io;
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::ops::Sub;
 
 use crate::output::OutputFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySql, Pool};
 
 const TARGET_REGION_SIZE: u64 = 256 * 1024 * 1024;
 const MINUTES_PER_HOUR: u64 = 60;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct WorkloadSourceConfiguration {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_user")]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    pub database: String,
+}
+
+fn default_host() -> String {
+    "localhost".into()
+}
+fn default_port() -> u16 {
+    3306
+}
+
+fn default_user() -> String {
+    "root".into()
+}
+
+impl WorkloadSourceConfiguration {
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        password: impl Into<String>,
+        database: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            user: user.into(),
+            password: password.into(),
+            database: database.into(),
+        }
+    }
+
+    pub fn load(file: String) -> Result<Vec<Self>> {
+        let file = file.to_lowercase();
+        let reader = BufReader::new(File::open(&file)?);
+        if file.ends_with(".json") {
+            Ok(serde_json::from_reader(reader)?)
+        } else if file.ends_with(".yaml") || file.ends_with(".yml") {
+            Ok(serde_yaml::from_reader(reader)?)
+        } else {
+            Err(anyhow!(
+                "Unknown batch configuration file format. Only json and yaml are supported"
+            ))
+        }
+    }
+    fn connection_string(&self) -> String {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            self.user, self.password, self.host, self.port, self.database
+        )
+    }
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct RequestDescription {
@@ -183,24 +246,16 @@ async fn confirm_and_run_analyze(output: OutputFormat, pool: &Pool<MySql>) -> Re
 
 pub async fn load_workload_description(
     output: OutputFormat,
-    host: &str,
-    port: u16,
-    user: &str,
-    password: &str,
-    database: &str,
+    config: WorkloadSourceConfiguration,
     analyze_before_start: bool,
 ) -> Result<Option<WorkloadDescription>> {
-    let connection_string = format!(
-        "mysql://{}:{}@{}:{}/{}",
-        user, password, host, port, database
-    );
-    let pool = sqlx::MySqlPool::connect(&connection_string).await?;
+    let pool = sqlx::MySqlPool::connect(&config.connection_string()).await?;
 
     if analyze_before_start {
         confirm_and_run_analyze(output, &pool).await?
     }
 
-    let tables = read_tables_information(&pool, database).await?;
+    let tables = read_tables_information(&pool, &config.database).await?;
     if is_tidb(&pool).await? {
         if is_tidb_serverless(&pool).await? {
             Ok(None)
@@ -208,7 +263,7 @@ pub async fn load_workload_description(
             Ok(Some(WorkloadDescription::tidb(
                 output,
                 tables,
-                read_tidb_statements_summary(&pool, database).await?,
+                read_tidb_statements_summary(&pool, &config.database).await?,
                 read_tidb_system_metrics(&pool).await?,
             )))
         }
@@ -216,7 +271,7 @@ pub async fn load_workload_description(
         Ok(Some(WorkloadDescription::mysql(
             output,
             tables,
-            read_mysql_statements_summary(&pool, database).await?,
+            read_mysql_statements_summary(&pool, &config.database).await?,
         )))
     } else if is_mariadb(&pool).await? {
         Err(anyhow!("Please enable the 'Performance Schema' on your MariaDB server and keep it active for at least a full business day to ensure comprehensive workload coverage. For instructions, see this guide: https://mariadb.com/kb/en/performance-schema-overview/#activating-the-performance-schema"))

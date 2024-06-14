@@ -3,6 +3,7 @@ mod output;
 mod source;
 
 use crate::output::OutputFormat;
+use crate::source::WorkloadSourceConfiguration;
 use clap::{ArgAction, Parser};
 
 #[derive(Parser)]
@@ -93,6 +94,14 @@ struct CalculatorOptions {
         help = "Output format. One of: json|yaml|human"
     )]
     output: OutputFormat,
+    #[arg(
+        id = "batch",
+        short = 'b',
+        long = "batch",
+        env = "BATCH",
+        help = "Batch configuration file for upstream databases."
+    )]
+    batch: Option<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -100,31 +109,50 @@ async fn main() {
     let output = options.output;
 
     output.welcome(&options);
-    let workload = match source::load_workload_description(
-        output,
-        &options.host,
-        options.port,
-        &options.user,
-        &options.password,
-        &options.database,
-        options.analyze,
-    )
-    .await
-    {
-        Err(e) => {
-            return output.fatal(&format!("The workload failed to load: {}", e));
-        }
-        Ok(Some(workload)) => workload,
-        Ok(None) => {
-            return output.info("You are already using TiDB Serverless. Please check your billing in the TiDB Cloud Console for charges. For more information, visit https://docs.pingcap.com/tidbcloud/tidb-cloud-billing");
-        }
+    let configurations = match options.batch {
+        Some(f) => match WorkloadSourceConfiguration::load(f) {
+            Ok(r) => r,
+            Err(e) => {
+                output.fatal(&e.to_string());
+                return;
+            }
+        },
+        None => vec![WorkloadSourceConfiguration::new(
+            options.host,
+            options.port,
+            options.user,
+            options.password,
+            options.database,
+        )],
     };
-    match calculator::estimate(&options.region, &workload) {
+
+    let mut workloads = Vec::with_capacity(configurations.len());
+    for configuration in configurations {
+        workloads.push(
+            match source::load_workload_description(
+                output,
+                configuration,
+                options.analyze,
+            )
+                .await
+            {
+                Err(e) => {
+                    return output.fatal(&format!("The workload failed to load: {}", e));
+                }
+                Ok(Some(workload)) => workload,
+                Ok(None) => {
+                    return output.info("You are already using TiDB Serverless. Please check your billing in the TiDB Cloud Console for charges. For more information, visit https://docs.pingcap.com/tidbcloud/tidb-cloud-billing");
+                }
+            }
+        );
+    }
+
+    match calculator::estimate(&options.region, &workloads) {
         Err(e) => {
             return output.fatal(&format!("The cost estimation failed: {}", e));
         }
-        Ok(estimation) => {
-            output.report(workload, estimation);
+        Ok(estimations) => {
+            output.report(workloads, estimations);
         }
     }
 }

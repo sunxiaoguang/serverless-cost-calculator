@@ -55,27 +55,33 @@ impl OutputFormat {
         }
     }
 
-    pub fn report(&self, workload: WorkloadDescription, estimation: WorkloadEstimation) {
+    pub fn report(&self, workloads: Vec<WorkloadDescription>, estimation: Vec<WorkloadEstimation>) {
         if let OutputFormat::Human = *self {
             return Self::output_human(estimation);
         }
+        let reports: Vec<WorkloadReport> = workloads
+            .into_iter()
+            .zip(estimation)
+            .map(|pair| WorkloadReport {
+                workload: pair.0,
+                estimation: pair.1,
+            })
+            .collect();
 
-        // leave room for estimating many upstream databases at once
-        let report = vec![WorkloadReport {
-            workload,
-            estimation,
-        }];
         println!(
             "{}",
             match *self {
-                OutputFormat::Json => serde_json::to_string_pretty(&report).unwrap(),
-                OutputFormat::Yaml => serde_yaml::to_string(&report).unwrap(),
+                OutputFormat::Json => serde_json::to_string_pretty(&reports).unwrap(),
+                OutputFormat::Yaml => serde_yaml::to_string(&reports).unwrap(),
                 _ => unreachable!(),
             }
         );
     }
 
-    fn output_human(estimation: WorkloadEstimation) {
+    fn output_human_step(index: Option<usize>, estimation: &WorkloadEstimation) {
+        if let Some(index) = index {
+            println!("Cluster: {}", format!("{}", index).bold().green());
+        }
         let total =
             if estimation.storage_cost + estimation.request_units_cost <= estimation.free_credit {
                 "$0.00".to_string()
@@ -99,6 +105,13 @@ impl OutputFormat {
         table.add_row(row![bFg -> "Free Credits", bFgr -> format!("-${}", Float::from_2(estimation.free_credit))]);
         table.add_row(row![bFg -> "Total", bFgr -> total]);
         table.printstd();
+    }
+
+    fn output_human(estimation: Vec<WorkloadEstimation>) {
+        let single_workload = estimation.len() == 1;
+        for pair in estimation.iter().enumerate() {
+            Self::output_human_step(if single_workload { None } else { Some(pair.0) }, pair.1)
+        }
 
         println!("\n{}", "Notes:".bold().green());
         println!("{}", "* Request units are estimated based on statistical data from the past, up to seven days. Be cautious: severe fluctuations in recent workload, such as ingesting a large volume of data, can skew the final estimation.".bold().green());
